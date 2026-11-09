@@ -24,8 +24,10 @@ DSpark trainer.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import NamedTuple
 
 import torch
@@ -255,6 +257,8 @@ class _DeepseekV41DSparkBlock(nn.Module):
             self.norm = norm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
             self.markov_head = _DeepseekV41DSparkMarkovHead(config.vocab_size, config.dspark_markov_rank, dtype)
             self.confidence_head = _DeepseekV41DSparkConfidenceHead(config.hidden_size, config.dspark_markov_rank)
+            # The released head and vLLM read the pre-norm residual; AutoModel defaults to the RMSNorm output.
+            self.confidence_on_residual = False
 
     @property
     def mlp(self) -> MoE:
@@ -322,7 +326,8 @@ class _DeepseekV41DSparkBlock(nn.Module):
         if previous_token_ids is not None:
             transition_logits, markov_embeddings = self.markov_head(previous_token_ids)
             if enable_confidence_head:
-                states, embeddings = normalized_hidden_states, markov_embeddings
+                states = hidden_states if self.confidence_on_residual else normalized_hidden_states
+                embeddings = markov_embeddings
                 if confidence_head_stop_gradient:
                     states, embeddings = states.detach(), embeddings.detach()
                 confidence_pred = self.confidence_head(states, embeddings)
@@ -626,6 +631,37 @@ class DeepseekV41DSparkModel(DeepseekV41DSparkBackbone):
     def layers(self) -> nn.ModuleList:
         """Expose native MTP stages to the shared AC/FSDP helpers."""
         return self.mtp
+
+    def load_released_draft(self, checkpoint_dir: str | Path) -> None:
+        """Overwrite every trainable draft weight with the ``mtp.*`` weights of a released checkpoint.
+
+        Args:
+            checkpoint_dir: Directory holding ``model.safetensors.index.json`` and
+                quantized (FP8/MXFP4 with E8M0 scales) or unquantized ``mtp.*`` tensors.
+        """
+        from safetensors import safe_open
+
+        checkpoint_dir = Path(checkpoint_dir)
+        weight_map = json.loads((checkpoint_dir / "model.safetensors.index.json").read_text())["weight_map"]
+        released: dict[str, torch.Tensor] = {}
+        for shard in sorted({file for key, file in weight_map.items() if key.startswith("mtp.")}):
+            with safe_open(checkpoint_dir / shard, "pt") as handle:
+                released.update({key: handle.get_tensor(key) for key in handle.keys() if key.startswith("mtp.")})
+        if not released:
+            raise ValueError(f"{checkpoint_dir} holds no mtp.* draft weights")
+        native = self.state_dict_adapter.from_hf(released)
+        own = self.state_dict()
+        expected = {key for key in own if key.startswith("mtp.")}
+        if native.keys() != expected:
+            raise ValueError(
+                f"Released draft does not match the native draft: missing {sorted(expected - native.keys())[:5]}, "
+                f"unexpected {sorted(native.keys() - expected)[:5]}"
+            )
+        with torch.no_grad():
+            for key, value in native.items():
+                if tuple(value.shape) != tuple(own[key].shape):
+                    raise ValueError(f"{key}: released shape {tuple(value.shape)} != native {tuple(own[key].shape)}")
+                own[key].copy_(value.to(device=own[key].device, dtype=own[key].dtype))
 
     def initialize_embeddings_and_head(
         self,

@@ -1223,6 +1223,18 @@ class TrainDSparkRecipe(BaseRecipe):
             # never builds a distributed setup, so it is excluded by construction.
             embed_src = gather_full_weight_module(embed_src)
             head_src = gather_full_weight_module(head_src)
+        # DeepSeek V4.1 only: fine-tune the released draft instead of training from scratch, and keep the
+        # confidence head on the released (and vLLM-served) pre-norm input.
+        draft_init_from = recipe_cfg.get("draft_init_from", None)
+        confidence_head_input = str(recipe_cfg.get("confidence_head_input", "normalized"))
+        if (draft_init_from or confidence_head_input != "normalized") and not is_deepseek_v41_target:
+            raise ValueError("draft_init_from and confidence_head_input are only supported for DeepSeek V4.1 targets")
+        if confidence_head_input not in ("normalized", "residual"):
+            raise ValueError(f"confidence_head_input must be 'normalized' or 'residual', got {confidence_head_input!r}")
+        if draft_init_from:
+            self.draft_model.load_released_draft(draft_init_from)
+        if is_deepseek_v41_target:
+            self.draft_model.mtp[-1].confidence_on_residual = confidence_head_input == "residual"
         self.draft_model.initialize_embeddings_and_head(
             embed_tokens=embed_src,
             lm_head=head_src,
