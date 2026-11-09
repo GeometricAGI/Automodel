@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import collections
 import json
+import os
 import pathlib
 import random
 import re
@@ -23,7 +24,19 @@ import time
 import httpx
 from transformers import AutoTokenizer
 
-URL = "http://localhost:8000/v1/chat/completions"
+# Engines to spread requests over (comma-separated base URLs); --concurrency applies to each.
+URLS = [u.rstrip("/") + "/v1/chat/completions"
+        for u in os.environ.get("DSPARK_ENGINES", "http://localhost:8000").split(",")]
+
+
+class Engines:
+    """One semaphore per engine; item i goes to engine i mod n."""
+
+    def __init__(self, conc):
+        self.sems = [asyncio.Semaphore(conc) for _ in URLS]
+
+    def pick(self, i):
+        return URLS[i % len(URLS)], self.sems[i % len(URLS)]
 MODEL = "deepseek/deepseek-v4.1-flash-1017"
 from vllm.tokenizers.deepseek_v41 import _normalize_messages
 from vllm.tokenizers.deepseek_v41_encoding import encode_messages
@@ -63,7 +76,7 @@ class Stats:
 TEMPERATURE = None
 
 
-async def turn(client, messages, stats, max_tokens, tools=None):
+async def turn(client, messages, stats, max_tokens, tools=None, url=URLS[0]):
     body = {"model": MODEL, "messages": messages, "max_tokens": max_tokens, "stream": True,
             **({"tools": tools, "tool_choice": "auto"} if tools else {}),
             **({"temperature": TEMPERATURE} if TEMPERATURE is not None else {}),
@@ -71,7 +84,7 @@ async def turn(client, messages, stats, max_tokens, tools=None):
     reasoning, content, token_ids = [], [], []
     calls: dict[int, dict] = {}
     usage = None
-    async with client.stream("POST", URL, json=body) as r:
+    async with client.stream("POST", url, json=body) as r:
         r.raise_for_status()
         async for line in r.aiter_lines():
             if not line.startswith("data: ") or line == "data: [DONE]":
@@ -144,17 +157,18 @@ def done_keys(out):
 async def agentic(n, conc, out, max_tokens):
     convs = json.load(open(ROLLOUTS))["conversations"][:n]
     done = done_keys(out)
-    stats, sem, tokens = Stats(), asyncio.Semaphore(conc), [0]
+    stats, engines, tokens = Stats(), Engines(conc), [0]
     with out.open("a") as f:
       async with httpx.AsyncClient(timeout=None) as client:
         async def one(i, conv):
             if f"rollout:{i}" in done:
                 return
+            url, sem = engines.pick(i)
             async with sem:
                 history, completions = [], []
                 for t in conv:
                     history += t["messages"]
-                    msg, ids, u = await turn(client, history, stats, max_tokens)
+                    msg, ids, u = await turn(client, history, stats, max_tokens, url=url)
                     history.append(msg)
                     completions.append(ids)
                     tokens[0] += (u or {}).get("completion_tokens", 0)
@@ -173,7 +187,7 @@ async def prompts(n, conc, out, max_tokens, seed):
         rows += pq.read_table(p).to_pylist()
     random.Random(seed).shuffle(rows)
     done = done_keys(out)
-    stats, sem, tokens = Stats(), asyncio.Semaphore(conc), [0]
+    stats, engines, tokens = Stats(), Engines(conc), [0]
     with out.open("a") as f:
       async with httpx.AsyncClient(timeout=None) as client:
         async def one(i, row):
@@ -184,8 +198,9 @@ async def prompts(n, conc, out, max_tokens, seed):
             if first is None:
                 return
             msgs = [{"role": "user", "content": first.get("value", first.get("content"))}]
+            url, sem = engines.pick(i)
             async with sem:
-                msg, ids, u = await turn(client, msgs, stats, max_tokens)
+                msg, ids, u = await turn(client, msgs, stats, max_tokens, url=url)
             tokens[0] += (u or {}).get("completion_tokens", 0)
             f.write(json.dumps({"key": f"blend:{seed}:{i}", "messages": msgs + [msg], "completion_token_ids": [ids],
                                 "source": f"open-perfectblend:{row.get('source', '')}"}) + "\n")
@@ -207,7 +222,7 @@ def render_tokens(messages, tools):
     return len(TOKENIZER.encode(prompt, add_special_tokens=False))
 
 
-async def run_session(client, msgs, tools, turns, stats, max_tokens, budget):
+async def run_session(client, msgs, tools, turns, stats, max_tokens, budget, url):
     """Replay one agent session, putting the model's own answer in place of each original one.
 
     The context is the system message plus a window of recent messages. When a turn's context would pass the
@@ -250,7 +265,7 @@ async def run_session(client, msgs, tools, turns, stats, max_tokens, budget):
                 return rows, generated
             window, start = window + 1, new_start
         context = [{k: v for k, v in m.items() if k not in ("train", "_ids")} for m in [system] + history[start:]]
-        msg, ids, usage = await turn(client, context, stats, max_tokens, tools)
+        msg, ids, usage = await turn(client, context, stats, max_tokens, tools, url)
         generated += (usage or {}).get("completion_tokens", 0)
         if not ids or ids[-1] != EOS_ID:
             break  # cut off at max_tokens: no history to continue from
@@ -268,17 +283,18 @@ async def sessions(n, conc, out, max_tokens, budget, seed):
         rows += pq.read_table(p).to_pylist()
     random.Random(seed).shuffle(rows)
     done = done_keys(out)
-    stats, sem, tokens = Stats(), asyncio.Semaphore(conc), [0]
+    stats, engines, tokens = Stats(), Engines(conc), [0]
     with out.open("a") as f:
       async with httpx.AsyncClient(timeout=None) as client:
-        async def one(row):
+        async def one(i, row):
             key = f"requesty:{row['id']}"
             if key in done:
                 return
+            url, sem = engines.pick(i)
             async with sem:
                 session_rows, generated = await run_session(client, json.loads(row["messages"]),
                                                             json.loads(row["tools"]), row["turns"], stats,
-                                                            max_tokens, budget)
+                                                            max_tokens, budget, url)
             tokens[0] += generated
             # A session's rows are written together, so a stop never leaves half a session behind.
             for r in session_rows:
@@ -288,7 +304,7 @@ async def sessions(n, conc, out, max_tokens, budget, seed):
                 f.write(json.dumps({"key": key, "messages": [], "completion_token_ids": [], "source": "empty"}) + "\n")
             f.flush()
         t0 = time.time()
-        await asyncio.gather(*(one(r) for r in rows[:n]))
+        await asyncio.gather(*(one(i, r) for i, r in enumerate(rows[:n])))
     return stats, tokens[0], time.time() - t0
 
 
