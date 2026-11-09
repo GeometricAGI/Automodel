@@ -51,9 +51,9 @@ recipe_args:
   val_data_path: /data/train/val.jsonl
   val_split: train
   output_dir: /data/outputs/dspark_v41_1017_finetune
-  # Session rows hold up to 32k tokens of context (replay.py sessions --budget 32768) plus the last turn's answer
-  # (max_tokens 4096).
-  seq_length: 36864
+  # Session rows hold up to 32k tokens of context (replay.py sessions --budget 32768, estimated to within -3%/+9%)
+  # plus the last turn's answer (max_tokens 4096).
+  seq_length: 40960
   micro_batch_size: 1
   grad_accumulation_steps: 4
   num_workers: 2

@@ -222,6 +222,23 @@ def render_tokens(messages, tools):
     return len(TOKENIZER.encode(prompt, add_special_tokens=False))
 
 
+MESSAGE_OVERHEAD = 8  # role markers and separators the template adds around a message
+
+
+def message_tokens(m):
+    """Tokens a history message adds to a prompt: exact for our answers (their generated ids), a close estimate
+    (content, reasoning and tool calls tokenized once and cached) for the others."""
+    if "_ids" in m:
+        return len(m["_ids"]) + MESSAGE_OVERHEAD
+    if "_n" not in m:
+        text = (m.get("content") or "") if isinstance(m.get("content"), str) else json.dumps(m.get("content"))
+        text += m.get("reasoning_content") or ""
+        if m.get("tool_calls"):
+            text += json.dumps([tc["function"] for tc in m["tool_calls"]])
+        m["_n"] = len(TOKENIZER.encode(text, add_special_tokens=False)) + MESSAGE_OVERHEAD
+    return m["_n"]
+
+
 async def run_session(client, msgs, tools, turns, stats, max_tokens, budget, url):
     """Replay one agent session, putting the model's own answer in place of each original one.
 
@@ -231,6 +248,7 @@ async def run_session(client, msgs, tools, turns, stats, max_tokens, budget, url
     previous window stay as history with train: false. Returns (rows, completion tokens).
     """
     system, history = msgs[0], []
+    system_tokens = render_tokens([system], tools)  # the system prompt with every tool schema, exact
     generated_in = {}  # history index -> window number of our answers
     ours = set(turns)
     window, start, rows, generated, pos = 0, 0, [], 0, 1
@@ -251,20 +269,19 @@ async def run_session(client, msgs, tools, turns, stats, max_tokens, budget, url
                 m = dict(m, train=False)  # an original answer that is not a turn point: history only
             history.append(m)
         pos = t + 1
-        if render_tokens([system] + history[start:], tools) > budget:
+        if system_tokens + sum(message_tokens(m) for m in history[start:]) > budget:
             close_window(len(history))
-            boundaries = [i for i in range(start + 1, len(history)) if history[i]["role"] in ("user", "assistant")]
-            lo, hi, new_start = 0, len(boundaries) - 1, None
-            while lo <= hi:  # the earliest boundary whose suffix fits half the budget
-                mid = (lo + hi) // 2
-                if render_tokens([system] + history[boundaries[mid]:], tools) <= budget // 2:
-                    new_start, hi = boundaries[mid], mid - 1
-                else:
-                    lo = mid + 1
+            new_start, size = None, system_tokens
+            for i in range(len(history) - 1, start, -1):  # the earliest boundary whose suffix fits half the budget
+                size += message_tokens(history[i])
+                if size > budget // 2:
+                    break
+                if history[i]["role"] in ("user", "assistant"):
+                    new_start = i
             if new_start is None:
                 return rows, generated
             window, start = window + 1, new_start
-        context = [{k: v for k, v in m.items() if k not in ("train", "_ids")} for m in [system] + history[start:]]
+        context = [{k: v for k, v in m.items() if k not in ("train", "_ids", "_n")} for m in [system] + history[start:]]
         msg, ids, usage = await turn(client, context, stats, max_tokens, tools, url)
         generated += (usage or {}).get("completion_tokens", 0)
         if not ids or ids[-1] != EOS_ID:
@@ -298,7 +315,7 @@ async def sessions(n, conc, out, max_tokens, budget, seed):
             tokens[0] += generated
             # A session's rows are written together, so a stop never leaves half a session behind.
             for r in session_rows:
-                r["messages"] = [{k: v for k, v in m.items() if k != "_ids"} for m in r["messages"]]
+                r["messages"] = [{k: v for k, v in m.items() if k not in ("_ids", "_n")} for m in r["messages"]]
                 f.write(json.dumps({"key": key, **r, "source": f"requesty:{row['harness']}"}) + "\n")
             if not session_rows:
                 f.write(json.dumps({"key": key, "messages": [], "completion_token_ids": [], "source": "empty"}) + "\n")
