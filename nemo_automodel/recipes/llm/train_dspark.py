@@ -1801,7 +1801,18 @@ class TrainDSparkRecipe(BaseRecipe):
                 completed_steps = 0
                 last_batch_idx = -1
                 num_batches = len(self.train_dataloader)
+                # A mid-epoch resume continues where the checkpoint left off: the sampler's order is fixed by
+                # its seed and epoch, so skip the micro-batches of the optimizer steps already taken.
+                skip_batches = 0
+                if epoch_idx == start_epoch and self.runtime.global_step > 0:
+                    steps_per_epoch = optim_steps_per_epoch(num_batches, self.grad_accumulation_steps)
+                    done = self.runtime.global_step - epoch_idx * steps_per_epoch
+                    skip_batches = min(num_batches, max(0, done) * self.grad_accumulation_steps)
+                    if skip_batches and self.dist_env.is_main:
+                        logger.info("Resuming epoch %d after %d of %d batches", epoch_idx, skip_batches, num_batches)
                 for batch_idx, batch in enumerate(self.train_dataloader):
+                    if batch_idx < skip_batches:
+                        continue
                     last_batch_idx = batch_idx
                     is_optim_step = (pending_micro_batches + 1 == self.grad_accumulation_steps) or (
                         batch_idx == num_batches - 1
