@@ -21,6 +21,18 @@ from paths import CKPT  # noqa: E402
 
 
 
+def load_model(ckpt, anchors):
+    """NeMo's native draft with the released drafter, embedding and LM head, on the GPU."""
+    torch.manual_seed(0)
+    model = build(ckpt, num_anchors=anchors)
+    model.load_released_draft(ckpt)
+    wm = json.loads((ckpt / "model.safetensors.index.json").read_text())["weight_map"]
+    for name, module in (("embed.weight", model.embed_tokens), ("head.weight", model.lm_head)):
+        with safe_open(ckpt / wm[name], "pt") as h:
+            module.weight.data.copy_(h.get_tensor(name))
+    return model.cuda().eval()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("capture", type=pathlib.Path)
@@ -30,15 +42,7 @@ def main():
     ap.add_argument("--shifts", type=int, nargs="+", default=[0],
                     help="diagnostic: move features this many positions later (+) or earlier (-)")
     a = ap.parse_args()
-    torch.manual_seed(0)
-    model = build(CKPT, num_anchors=a.anchors)
-    model.load_released_draft(CKPT)
-
-    wm = json.loads((CKPT / "model.safetensors.index.json").read_text())["weight_map"]
-    for name, module in (("embed.weight", model.embed_tokens), ("head.weight", model.lm_head)):
-        with safe_open(CKPT / wm[name], "pt") as h:
-            module.weight.data.copy_(h.get_tensor(name))
-    model = model.cuda().eval()
+    model = load_model(CKPT, a.anchors)
     seqs = torch.load(a.capture)
     global ZERO
     ZERO = a.zero_features
