@@ -6,6 +6,7 @@ import sys
 
 from transformers import AutoTokenizer
 
+from prepare import parse_tool_arguments
 from replay import from_token_ids
 
 from paths import CKPT, TRAINING_TEMPLATE
@@ -19,8 +20,13 @@ for path in [a for a in sys.argv[1:] if not a.startswith("--")]:
         row = json.loads(line)
         if REBUILD:
             turns = iter(row["completion_token_ids"])
-            row["messages"] = [from_token_ids(next(turns)) if m["role"] == "assistant" else m for m in row["messages"]]
-        out = tok.apply_chat_template(row["messages"], chat_template=template, tokenize=True, return_dict=True,
+            row["messages"] = [dict(from_token_ids(next(turns)), train=True)
+                               if m["role"] == "assistant" and m.get("train", True) else m for m in row["messages"]]
+        if not row["messages"]:
+            continue
+        row["messages"] = parse_tool_arguments(row["messages"])
+        out = tok.apply_chat_template(row["messages"], chat_template=template, tools=row.get("tools"),
+                                      tokenize=True, return_dict=True,
                                       return_assistant_tokens_mask=True, thinking_mode="thinking",
                                       drop_thinking="--keep-thinking" not in sys.argv)
         ids, mask = out["input_ids"], out["assistant_masks"]

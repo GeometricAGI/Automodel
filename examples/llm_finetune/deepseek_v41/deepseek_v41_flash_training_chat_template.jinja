@@ -254,7 +254,8 @@
 
     {%- elif m.role == "assistant" -%}
         {%- set prev_has_task = idx > 0 and msgs[idx - 1].get("task") is not none -%}
-        {%- generation -%}
+        {#- A turn with train: false is rendered the same but left out of the supervised span. -#}
+        {%- set body -%}
         {%- if thinking and not prev_has_task and (not effective_drop or idx > state.last_user) -%}
             {{- ((m.reasoning_content if m.get("reasoning_content") is not none else m.get("thinking")) or "") ~ "</think>" -}}
         {%- endif -%}
@@ -274,7 +275,12 @@
             {{- "\n\n<" ~ DSML ~ " calls>\n" ~ tcs.lines | join("\n") ~ "\n</" ~ DSML ~ " calls>" -}}
         {%- endif -%}
         {%- if not m.get("wo_eos", false) -%}{{- "<｜end▁of▁sentence｜>" -}}{%- endif -%}
-        {%- endgeneration -%}
+        {%- endset -%}
+        {%- if m.get("train", true) -%}
+            {%- generation -%}{{- body -}}{%- endgeneration -%}
+        {%- else -%}
+            {{- body -}}
+        {%- endif -%}
 
     {%- else -%}
         {{- raise_exception("Unknown role: " ~ m.role) -}}

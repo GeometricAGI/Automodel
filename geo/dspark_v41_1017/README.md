@@ -10,10 +10,17 @@ Set `DSPARK_CKPT` to the served checkpoint and `DSPARK_WORK` to the folder holdi
 
 ## Workflow
 
-1. **Generate** (vLLM environment, engine serving on port 8000 with adaptive verification off):
-   `python replay.py prompts --n 300000 --concurrency 24 --out data/blend.jsonl`. It records tokens per decode step
-   by content type (reasoning, answer, tool call) and saves each turn's generated token IDs. Rerunning the same
-   command after a stop appends only the prompts not yet written.
+1. **Generate** (vLLM environment, engine serving on port 8000 with adaptive verification off). Agentic data:
+   `python replay.py sessions --n 5000 --concurrency 24 --out data/sessions.jsonl` replays
+   [`Geometric-AI/requesty-agent-sessions`](https://huggingface.co/datasets/Geometric-AI/requesty-agent-sessions)
+   (`DSPARK_WORK/data/requesty-agent-sessions`) with each session's tools declared, putting the model's own answer
+   in place of each original one. The context is the system message plus a window of recent messages up to
+   `--budget` tokens (32k); when it would pass that, the window becomes a training row and a new window starts with
+   half the budget of recent history, whose earlier answers are marked `train: false` (context, not supervised).
+   Each row is therefore exactly the context its turns were generated from, and holds many turns. Single-turn
+   prompts: `python replay.py prompts --n 300000 --concurrency 24 --out data/blend.jsonl`. Both record tokens per
+   decode step by content type and save each turn's generated token IDs; rerunning the same command after a stop
+   appends only what is not yet written.
 2. **Prepare**: `python prepare.py data/train data/*.jsonl` rebuilds each assistant turn from its token IDs (the
    reasoning and tool-call parsers change the text) and drops rows with a turn that hit `max_tokens`.
    `template_check.py` checks that NeMo's training template reproduces the generated tokens.
@@ -45,3 +52,7 @@ Set `DSPARK_CKPT` to the served checkpoint and `DSPARK_WORK` to the folder holdi
   than 0.999.
 - Agentic data should declare its tools in the request, as production clients do: without tools the parser
   drops DSML calls from the response and the template drops earlier turns' reasoning.
+- Left-truncating agentic contexts to 16-64k changes the drafter's features (cosine 0.76-0.87 to the full
+  context's) but not its predictions: acceptance on the same tokens is unchanged (`parity/long_context.py`,
+  `parity/nemo_long.py`, 20 requesty turns of 46-164k tokens). The model's own output diverges after 30-60 tokens,
+  so generate the data from the same truncated context the trainer sees, as `replay.py sessions` does.

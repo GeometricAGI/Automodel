@@ -16,6 +16,27 @@ from replay import TOKENIZER, from_token_ids
 EOS_ID = TOKENIZER.convert_tokens_to_ids("<｜end▁of▁sentence｜>")
 
 
+def parse_tool_arguments(messages):
+    """Tool-call arguments as objects: the training template needs them so, and vLLM's encoder parses JSON-string
+    arguments the same way before rendering them."""
+    out = []
+    for m in messages:
+        if m.get("tool_calls"):
+            calls = []
+            for tc in m["tool_calls"]:
+                args = tc["function"]["arguments"]
+                if isinstance(args, str):
+                    try:
+                        parsed = json.loads(args)
+                    except json.JSONDecodeError:
+                        parsed = None
+                    args = parsed if isinstance(parsed, dict) else {"arguments": args}
+                calls.append({**tc, "function": {**tc["function"], "arguments": args}})
+            m = {**m, "tool_calls": calls}
+        out.append(m)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out", type=pathlib.Path)
@@ -31,12 +52,15 @@ def main():
             if not gen or any(not ids or ids[-1] != EOS_ID for ids in gen):
                 dropped += 1
                 continue
+            # Supervised turns (no train flag, or train: true) are the generated ones, in order.
             turns = iter(gen)
-            out = {"messages": [from_token_ids(next(turns)) if m["role"] == "assistant" else m
-                                for m in row["messages"]]}
+            out = {"messages": parse_tool_arguments([dict(from_token_ids(next(turns)), **({"train": True} if "train" in m else {}))
+                                if m["role"] == "assistant" and m.get("train", True) else m
+                                for m in row["messages"]])}
             if row.get("tools"):
                 out["tools"] = row["tools"]
-            rows.append(out)
+            if out["messages"]:
+                rows.append(out)
     random.Random(a.seed).shuffle(rows)
     a.out.mkdir(parents=True, exist_ok=True)
     n_val = min(a.val, len(rows) // 10)

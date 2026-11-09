@@ -7,6 +7,7 @@ step drafts the same number of tokens.
 
   python replay.py agentic --n 16 --out data/agentic.jsonl     # latency_tests coding rollouts, turn by turn
   python replay.py prompts --n 2000 --out data/blend.jsonl      # single-turn prompts from open-perfectblend
+  python replay.py sessions --n 5000 --out data/sessions.jsonl  # requesty agent sessions, tools declared
 
 Resumable: rerunning the same command after a stop keeps the rows already written and generates only the rest.
 """
@@ -24,12 +25,17 @@ from transformers import AutoTokenizer
 
 URL = "http://localhost:8000/v1/chat/completions"
 MODEL = "deepseek/deepseek-v4.1-flash-1017"
+from vllm.tokenizers.deepseek_v41 import _normalize_messages
+from vllm.tokenizers.deepseek_v41_encoding import encode_messages
+
 from paths import CKPT, WORK
 
 ROLLOUTS = WORK / "agentic/corpus/rollout_ctx32768.json"
 BLEND = WORK / "data/open-perfectblend"
+REQUESTY = WORK / "data/requesty-agent-sessions/data"
 TOKENIZER = AutoTokenizer.from_pretrained(CKPT)
 EOS = "<｜end▁of▁sentence｜>"
+EOS_ID = TOKENIZER.convert_tokens_to_ids(EOS)
 TOOL_CALL = re.compile(r"<function|\"name\"\s*:|```(?:json|bash)?\s*\{|\bexecute_bash\b|\bstr_replace_editor\b")
 
 
@@ -57,8 +63,9 @@ class Stats:
 TEMPERATURE = None
 
 
-async def turn(client, messages, stats, max_tokens):
+async def turn(client, messages, stats, max_tokens, tools=None):
     body = {"model": MODEL, "messages": messages, "max_tokens": max_tokens, "stream": True,
+            **({"tools": tools, "tool_choice": "auto"} if tools else {}),
             **({"temperature": TEMPERATURE} if TEMPERATURE is not None else {}),
             "return_token_ids": True, "stream_options": {"include_usage": True}}
     reasoning, content, token_ids = [], [], []
@@ -188,13 +195,111 @@ async def prompts(n, conc, out, max_tokens, seed):
     return stats, tokens[0], time.time() - t0
 
 
+def render_tokens(messages, tools):
+    """Prompt tokens for a request, rendered as the server does (tools in the system message)."""
+    conv = _normalize_messages([{k: v for k, v in m.items() if k != "train"} for m in messages])
+    system = next((m for m in conv if m["role"] == "system"), None)
+    if system is None:
+        system = {"role": "system", "content": ""}
+        conv.insert(0, system)
+    system["tools"] = tools
+    prompt = encode_messages(conv, thinking_mode="thinking", drop_thinking=True, reasoning_effort="high")
+    return len(TOKENIZER.encode(prompt, add_special_tokens=False))
+
+
+async def run_session(client, msgs, tools, turns, stats, max_tokens, budget):
+    """Replay one agent session, putting the model's own answer in place of each original one.
+
+    The context is the system message plus a window of recent messages. When a turn's context would pass the
+    budget, the window's rows are closed and a new window starts at the latest message boundary that leaves half
+    the budget, so each row is a context exactly as its turns were generated from. Answers carried over from the
+    previous window stay as history with train: false. Returns (rows, completion tokens).
+    """
+    system, history = msgs[0], []
+    generated_in = {}  # history index -> window number of our answers
+    ours = set(turns)
+    window, start, rows, generated, pos = 0, 0, [], 0, 1
+
+    def close_window(end):
+        mine = [i for i in range(start, end) if generated_in.get(i) == window]
+        if not mine:
+            return
+        rows.append({"messages": [system] + [dict(history[i], train=generated_in.get(i) == window)
+                                             for i in range(start, end)],
+                     "tools": tools, "completion_token_ids": [history[i]["_ids"] for i in mine]})
+
+    for t in turns:
+        if t >= len(msgs) or msgs[t]["role"] != "assistant":
+            break
+        for m in msgs[pos:t]:
+            if m["role"] == "assistant":
+                m = dict(m, train=False)  # an original answer that is not a turn point: history only
+            history.append(m)
+        pos = t + 1
+        if render_tokens([system] + history[start:], tools) > budget:
+            close_window(len(history))
+            boundaries = [i for i in range(start + 1, len(history)) if history[i]["role"] in ("user", "assistant")]
+            lo, hi, new_start = 0, len(boundaries) - 1, None
+            while lo <= hi:  # the earliest boundary whose suffix fits half the budget
+                mid = (lo + hi) // 2
+                if render_tokens([system] + history[boundaries[mid]:], tools) <= budget // 2:
+                    new_start, hi = boundaries[mid], mid - 1
+                else:
+                    lo = mid + 1
+            if new_start is None:
+                return rows, generated
+            window, start = window + 1, new_start
+        context = [{k: v for k, v in m.items() if k not in ("train", "_ids")} for m in [system] + history[start:]]
+        msg, ids, usage = await turn(client, context, stats, max_tokens, tools)
+        generated += (usage or {}).get("completion_tokens", 0)
+        if not ids or ids[-1] != EOS_ID:
+            break  # cut off at max_tokens: no history to continue from
+        history.append(dict(msg, _ids=ids))
+        generated_in[len(history) - 1] = window
+    close_window(len(history))
+    return rows, generated
+
+
+async def sessions(n, conc, out, max_tokens, budget, seed):
+    import pyarrow.parquet as pq
+
+    rows = []
+    for p in sorted(REQUESTY.glob("*.parquet")):
+        rows += pq.read_table(p).to_pylist()
+    random.Random(seed).shuffle(rows)
+    done = done_keys(out)
+    stats, sem, tokens = Stats(), asyncio.Semaphore(conc), [0]
+    with out.open("a") as f:
+      async with httpx.AsyncClient(timeout=None) as client:
+        async def one(row):
+            key = f"requesty:{row['id']}"
+            if key in done:
+                return
+            async with sem:
+                session_rows, generated = await run_session(client, json.loads(row["messages"]),
+                                                            json.loads(row["tools"]), row["turns"], stats,
+                                                            max_tokens, budget)
+            tokens[0] += generated
+            # A session's rows are written together, so a stop never leaves half a session behind.
+            for r in session_rows:
+                r["messages"] = [{k: v for k, v in m.items() if k != "_ids"} for m in r["messages"]]
+                f.write(json.dumps({"key": key, **r, "source": f"requesty:{row['harness']}"}) + "\n")
+            if not session_rows:
+                f.write(json.dumps({"key": key, "messages": [], "completion_token_ids": [], "source": "empty"}) + "\n")
+            f.flush()
+        t0 = time.time()
+        await asyncio.gather(*(one(r) for r in rows[:n]))
+    return stats, tokens[0], time.time() - t0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["agentic", "prompts"])
+    ap.add_argument("mode", choices=["agentic", "prompts", "sessions"])
     ap.add_argument("--n", type=int, required=True)
     ap.add_argument("--concurrency", type=int, default=16)
     ap.add_argument("--max-tokens", type=int, default=None)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--budget", type=int, default=32768, help="sessions: context tokens per training row")
     ap.add_argument("--temperature", type=float, default=None, help="default: the server's (1.0 in production)")
     ap.add_argument("--out", type=pathlib.Path, required=True)
     a = ap.parse_args()
@@ -203,6 +308,8 @@ def main():
     a.out.parent.mkdir(parents=True, exist_ok=True)
     if a.mode == "agentic":
         stats, toks, secs = asyncio.run(agentic(a.n, a.concurrency, a.out, a.max_tokens or 1024))
+    elif a.mode == "sessions":
+        stats, toks, secs = asyncio.run(sessions(a.n, a.concurrency, a.out, a.max_tokens or 4096, a.budget, a.seed))
     else:
         stats, toks, secs = asyncio.run(prompts(a.n, a.concurrency, a.out, a.max_tokens or 8192, a.seed))
     print(f"[{a.mode}] {toks:,} completion tokens in {secs:.0f} s = {toks / secs:.0f} tok/s at concurrency {a.concurrency}")
