@@ -159,7 +159,7 @@ async def agentic(n, conc, out, max_tokens):
     done = done_keys(out)
     stats, engines, tokens = Stats(), Engines(conc), [0]
     with out.open("a") as f:
-      async with httpx.AsyncClient(timeout=None) as client:
+      async with httpx.AsyncClient(timeout=None, limits=httpx.Limits(max_connections=None, max_keepalive_connections=None)) as client:
         async def one(i, conv):
             if f"rollout:{i}" in done:
                 return
@@ -188,7 +188,7 @@ async def prompts(n, conc, out, max_tokens, seed):
     done = done_keys(out)
     stats, engines, tokens = Stats(), Engines(conc), [0]
     with out.open("a") as f:
-      async with httpx.AsyncClient(timeout=None) as client:
+      async with httpx.AsyncClient(timeout=None, limits=httpx.Limits(max_connections=None, max_keepalive_connections=None)) as client:
         async def one(i, line):
             if f"blend:{seed}:{i}" in done:
                 return
@@ -300,7 +300,7 @@ async def sessions(n, conc, out, max_tokens, budget, seed):
     done = done_keys(out)
     stats, engines, tokens = Stats(), Engines(conc), [0]
     with out.open("a") as f:
-      async with httpx.AsyncClient(timeout=None) as client:
+      async with httpx.AsyncClient(timeout=None, limits=httpx.Limits(max_connections=None, max_keepalive_connections=None)) as client:
         async def one(i, line):
             key = "requesty:" + re.match(r'\{"id": "([^"]+)"', line).group(1)
             if key in done:
