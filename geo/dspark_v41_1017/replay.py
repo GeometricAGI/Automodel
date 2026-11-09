@@ -1,0 +1,213 @@
+"""Replay prompts through the local engine, measuring DSpark acceptance per content type and saving the
+conversations as drafter-training data (NeMo AutoModel `messages` format, reasoning kept as reasoning_content).
+
+Tokens per streamed chunk = 1 + accepted drafts for that request's decode step, since vLLM streams each step's
+tokens together; `return_token_ids` gives the exact count. Run the server with adaptive verification off so every
+step drafts the same number of tokens.
+
+  python replay.py agentic --n 16 --out data/agentic.jsonl     # latency_tests coding rollouts, turn by turn
+  python replay.py prompts --n 2000 --out data/blend.jsonl      # single-turn prompts from open-perfectblend
+
+Resumable: rerunning the same command after a stop keeps the rows already written and generates only the rest.
+"""
+import argparse
+import asyncio
+import collections
+import json
+import pathlib
+import random
+import re
+import time
+
+import httpx
+from transformers import AutoTokenizer
+
+URL = "http://localhost:8000/v1/chat/completions"
+MODEL = "deepseek/deepseek-v4.1-flash-1017"
+from paths import CKPT, WORK
+
+ROLLOUTS = WORK / "agentic/corpus/rollout_ctx32768.json"
+BLEND = WORK / "data/open-perfectblend"
+TOKENIZER = AutoTokenizer.from_pretrained(CKPT)
+EOS = "<｜end▁of▁sentence｜>"
+TOOL_CALL = re.compile(r"<function|\"name\"\s*:|```(?:json|bash)?\s*\{|\bexecute_bash\b|\bstr_replace_editor\b")
+
+
+class Stats:
+    def __init__(self):
+        self.steps = collections.Counter()
+        self.tokens = collections.Counter()
+        self.hist = collections.defaultdict(collections.Counter)
+
+    def add(self, kind, n):
+        self.steps[kind] += 1
+        self.tokens[kind] += n
+        self.hist[kind][min(n, 4)] += 1
+
+    def report(self):
+        rows = []
+        for kind in sorted(self.steps):
+            s, t = self.steps[kind], self.tokens[kind]
+            h = self.hist[kind]
+            dist = " ".join(f"{k}:{100 * h[k] / s:4.1f}%" for k in sorted(h))
+            rows.append(f"  {kind:10s} steps {s:7d}  tokens {t:8d}  tokens/step {t / s:.2f}  [{dist}]")
+        return "\n".join(rows)
+
+
+TEMPERATURE = None
+
+
+async def turn(client, messages, stats, max_tokens):
+    body = {"model": MODEL, "messages": messages, "max_tokens": max_tokens, "stream": True,
+            **({"temperature": TEMPERATURE} if TEMPERATURE is not None else {}),
+            "return_token_ids": True, "stream_options": {"include_usage": True}}
+    reasoning, content, token_ids = [], [], []
+    calls: dict[int, dict] = {}
+    usage = None
+    async with client.stream("POST", URL, json=body) as r:
+        r.raise_for_status()
+        async for line in r.aiter_lines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            ev = json.loads(line[6:])
+            usage = ev.get("usage") or usage
+            if not ev.get("choices"):
+                continue
+            ch = ev["choices"][0]
+            ids = ch.get("token_ids") or []
+            token_ids += ids
+            n = len(ids)
+            d = ch.get("delta", {})
+            for tc in d.get("tool_calls") or []:
+                call = calls.setdefault(tc.get("index", 0), {"id": tc.get("id"), "type": "function",
+                                                             "function": {"name": "", "arguments": ""}})
+                fn = tc.get("function") or {}
+                call["function"]["name"] += fn.get("name") or ""
+                call["function"]["arguments"] += fn.get("arguments") or ""
+            r_txt, c_txt = d.get("reasoning") or d.get("reasoning_content") or "", d.get("content") or ""
+            if r_txt:
+                reasoning.append(r_txt)
+            if c_txt:
+                content.append(c_txt)
+            if n:
+                if d.get("tool_calls"):
+                    kind = "tool_call"
+                elif r_txt and not c_txt:
+                    kind = "reasoning"
+                elif c_txt and not r_txt:
+                    kind = "tool_call" if TOOL_CALL.search("".join(content)[-400:]) else "answer"
+                elif not r_txt and not c_txt:
+                    # tokens the tool-call parser held back: the DSML call, dropped when the request declares no tools
+                    kind = "tool_call"
+                else:
+                    kind = "mixed"
+                stats.add(kind, n)
+    return from_token_ids(token_ids), token_ids, usage
+
+
+def from_token_ids(token_ids):
+    """The assistant message exactly as generated: the parsers trim the whitespace before </think> and drop a
+    DSML tool call when the request declares no tools, so the training template would not reproduce the tokens."""
+    raw = TOKENIZER.decode(token_ids, skip_special_tokens=False)
+    reasoning, sep, answer = raw.partition("</think>")
+    if not sep:
+        reasoning, answer = "", raw
+    return {"role": "assistant", "content": answer.removesuffix(EOS), "reasoning_content": reasoning}
+
+
+def done_keys(out):
+    """Keys of the rows a previous run already wrote, so a restarted run appends only the rest. A row cut off by
+    the stop is dropped from the file and generated again."""
+    if not out.exists():
+        return set()
+    keys, good = set(), []
+    for line in out.read_text().splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "key" not in row:
+            raise SystemExit(f"{out} was written by an older replay.py without row keys; use a new --out path")
+        keys.add(row["key"])
+        good.append(line)
+    out.write_text("".join(g + "\n" for g in good))
+    return keys
+
+
+async def agentic(n, conc, out, max_tokens):
+    convs = json.load(open(ROLLOUTS))["conversations"][:n]
+    done = done_keys(out)
+    stats, sem, tokens = Stats(), asyncio.Semaphore(conc), [0]
+    with out.open("a") as f:
+      async with httpx.AsyncClient(timeout=None) as client:
+        async def one(i, conv):
+            if f"rollout:{i}" in done:
+                return
+            async with sem:
+                history, completions = [], []
+                for t in conv:
+                    history += t["messages"]
+                    msg, ids, u = await turn(client, history, stats, max_tokens)
+                    history.append(msg)
+                    completions.append(ids)
+                    tokens[0] += (u or {}).get("completion_tokens", 0)
+                f.write(json.dumps({"key": f"rollout:{i}", "messages": history, "completion_token_ids": completions,
+                                    "source": "agentic-rollout"}) + "\n")
+                f.flush()
+        t0 = time.time()
+        await asyncio.gather(*(one(i, c) for i, c in enumerate(convs)))
+    return stats, tokens[0], time.time() - t0
+
+
+async def prompts(n, conc, out, max_tokens, seed):
+    rows = []
+    for p in sorted(BLEND.rglob("*.parquet")):
+        import pyarrow.parquet as pq
+        rows += pq.read_table(p).to_pylist()
+    random.Random(seed).shuffle(rows)
+    done = done_keys(out)
+    stats, sem, tokens = Stats(), asyncio.Semaphore(conc), [0]
+    with out.open("a") as f:
+      async with httpx.AsyncClient(timeout=None) as client:
+        async def one(i, row):
+            if f"blend:{seed}:{i}" in done:
+                return
+            conv = row.get("conversations") or row.get("messages") or []
+            first = next((m for m in conv if m.get("from", m.get("role")) in ("human", "user")), None)
+            if first is None:
+                return
+            msgs = [{"role": "user", "content": first.get("value", first.get("content"))}]
+            async with sem:
+                msg, ids, u = await turn(client, msgs, stats, max_tokens)
+            tokens[0] += (u or {}).get("completion_tokens", 0)
+            f.write(json.dumps({"key": f"blend:{seed}:{i}", "messages": msgs + [msg], "completion_token_ids": [ids],
+                                "source": f"open-perfectblend:{row.get('source', '')}"}) + "\n")
+            f.flush()
+        t0 = time.time()
+        await asyncio.gather(*(one(i, r) for i, r in enumerate(rows[:n])))
+    return stats, tokens[0], time.time() - t0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("mode", choices=["agentic", "prompts"])
+    ap.add_argument("--n", type=int, required=True)
+    ap.add_argument("--concurrency", type=int, default=16)
+    ap.add_argument("--max-tokens", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--temperature", type=float, default=None, help="default: the server's (1.0 in production)")
+    ap.add_argument("--out", type=pathlib.Path, required=True)
+    a = ap.parse_args()
+    global TEMPERATURE
+    TEMPERATURE = a.temperature
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    if a.mode == "agentic":
+        stats, toks, secs = asyncio.run(agentic(a.n, a.concurrency, a.out, a.max_tokens or 1024))
+    else:
+        stats, toks, secs = asyncio.run(prompts(a.n, a.concurrency, a.out, a.max_tokens or 8192, a.seed))
+    print(f"[{a.mode}] {toks:,} completion tokens in {secs:.0f} s = {toks / secs:.0f} tok/s at concurrency {a.concurrency}")
+    print(f"[{a.mode}] tokens per decode step by content (1 + accepted drafts):\n{stats.report()}")
+
+
+if __name__ == "__main__":
+    main()
