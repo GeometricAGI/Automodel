@@ -180,7 +180,12 @@ async def agentic(n, conc, out, max_tokens):
     return stats, tokens[0], time.time() - t0
 
 
-async def prompts(n, conc, out, max_tokens, seed):
+def held_out(session_id):
+    """Requesty sessions kept out of training for evaluation: every 25th id (200 of 5,000)."""
+    return int(session_id.lstrip("s")) % 25 == 0
+
+
+async def prompts(n, conc, out, max_tokens, seed, offset=0):
     # open-perfectblend.jsonl: the dataset's parquet rows in file order, one JSON object per line.
     with open(BLEND_JSONL) as fh:
         rows = fh.readlines()
@@ -206,7 +211,7 @@ async def prompts(n, conc, out, max_tokens, seed):
                                 "source": f"open-perfectblend:{row.get('source', '')}"}) + "\n")
             f.flush()
         t0 = time.time()
-        await asyncio.gather(*(one(i, r) for i, r in enumerate(rows[:n])))
+        await asyncio.gather(*(one(i, r) for i, r in enumerate(rows[:offset + n]) if i >= offset))
     return stats, tokens[0], time.time() - t0
 
 
@@ -292,10 +297,12 @@ async def run_session(client, msgs, tools, turns, stats, max_tokens, budget, url
     return rows, generated
 
 
-async def sessions(n, conc, out, max_tokens, budget, seed):
+async def sessions(n, conc, out, max_tokens, budget, seed, heldout=False):
     # sessions.jsonl holds the same sessions as the parquet shards; lines stay raw until their session starts.
     with open(REQUESTY / "sessions.jsonl") as fh:
         rows = fh.readlines()
+    if heldout:  # evaluation: only the sessions training leaves out
+        rows = [r for r in rows if held_out(re.match(r'\{"id": "([^"]+)"', r).group(1))]
     random.Random(seed).shuffle(rows)
     done = done_keys(out)
     stats, engines, tokens = Stats(), Engines(conc), [0]
@@ -331,6 +338,8 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--budget", type=int, default=32768, help="sessions: context tokens per training row")
+    ap.add_argument("--heldout", action="store_true", help="sessions: only the held-out evaluation sessions")
+    ap.add_argument("--offset", type=int, default=0, help="prompts: skip this many prompts of the shuffled order")
     ap.add_argument("--temperature", type=float, default=None, help="default: the server's (1.0 in production)")
     ap.add_argument("--out", type=pathlib.Path, required=True)
     a = ap.parse_args()
@@ -340,9 +349,10 @@ def main():
     if a.mode == "agentic":
         stats, toks, secs = asyncio.run(agentic(a.n, a.concurrency, a.out, a.max_tokens or 1024))
     elif a.mode == "sessions":
-        stats, toks, secs = asyncio.run(sessions(a.n, a.concurrency, a.out, a.max_tokens or 4096, a.budget, a.seed))
+        stats, toks, secs = asyncio.run(sessions(a.n, a.concurrency, a.out, a.max_tokens or 4096, a.budget, a.seed,
+                                                 a.heldout))
     else:
-        stats, toks, secs = asyncio.run(prompts(a.n, a.concurrency, a.out, a.max_tokens or 8192, a.seed))
+        stats, toks, secs = asyncio.run(prompts(a.n, a.concurrency, a.out, a.max_tokens or 8192, a.seed, a.offset))
     print(f"[{a.mode}] {toks:,} completion tokens in {secs:.0f} s = {toks / secs:.0f} tok/s at concurrency {a.concurrency}")
     print(f"[{a.mode}] tokens per decode step by content (1 + accepted drafts):\n{stats.report()}")
 

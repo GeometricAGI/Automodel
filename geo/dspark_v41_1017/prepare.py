@@ -11,7 +11,7 @@ import json
 import pathlib
 import random
 
-from replay import TOKENIZER, from_token_ids
+from replay import TOKENIZER, from_token_ids, held_out
 
 EOS_ID = TOKENIZER.convert_tokens_to_ids("<｜end▁of▁sentence｜>")
 
@@ -44,10 +44,13 @@ def main():
     ap.add_argument("--val", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
-    rows, dropped = [], 0
+    rows, dropped, heldout = [], 0, 0
     for path in a.inputs:
         for line in open(path):
             row = json.loads(line)
+            if row.get("key", "").startswith("requesty:") and held_out(row["key"].split(":", 1)[1]):
+                heldout += 1
+                continue
             gen = row["completion_token_ids"]
             if not gen or any(not ids or ids[-1] != EOS_ID for ids in gen):
                 dropped += 1
@@ -67,7 +70,8 @@ def main():
     for name, part in (("val", rows[:n_val]), ("train", rows[n_val:])):
         with open(a.out / f"{name}.jsonl", "w") as f:
             f.writelines(json.dumps(r, ensure_ascii=False) + "\n" for r in part)
-    print(f"{len(rows) - n_val} train, {n_val} val; dropped {dropped} rows with a truncated turn")
+    print(f"{len(rows) - n_val} train, {n_val} val; dropped {dropped} rows with a truncated turn and {heldout} rows of "
+          f"held-out evaluation sessions")
 
 
 if __name__ == "__main__":
