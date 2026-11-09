@@ -1,7 +1,8 @@
 """Locations the scripts share, overridable from the environment.
 
 DSPARK_CKPT  the served checkpoint (default ~/models/DeepSeek-V4.1-Flash-1017-vLLM-B300)
-DSPARK_WORK  inputs that are not in this repo: the rollout corpus and Open-PerfectBlend (default ~/runs)
+DSPARK_WORK  inputs that are not in this repo (default ~/runs): data/requesty-agent-sessions/sessions.jsonl,
+             data/open-perfectblend.jsonl and the rollout corpus
 """
 import os
 import pathlib

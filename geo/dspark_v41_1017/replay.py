@@ -44,8 +44,8 @@ from vllm.tokenizers.deepseek_v41_encoding import encode_messages
 from paths import CKPT, WORK
 
 ROLLOUTS = WORK / "agentic/corpus/rollout_ctx32768.json"
-BLEND = WORK / "data/open-perfectblend"
-REQUESTY = WORK / "data/requesty-agent-sessions/data"
+BLEND_JSONL = WORK / "data/open-perfectblend.jsonl"
+REQUESTY = WORK / "data/requesty-agent-sessions"
 TOKENIZER = AutoTokenizer.from_pretrained(CKPT)
 EOS = "<｜end▁of▁sentence｜>"
 EOS_ID = TOKENIZER.convert_tokens_to_ids(EOS)
@@ -181,18 +181,18 @@ async def agentic(n, conc, out, max_tokens):
 
 
 async def prompts(n, conc, out, max_tokens, seed):
-    rows = []
-    for p in sorted(BLEND.rglob("*.parquet")):
-        import pyarrow.parquet as pq
-        rows += pq.read_table(p).to_pylist()
+    # open-perfectblend.jsonl: the dataset's parquet rows in file order, one JSON object per line.
+    with open(BLEND_JSONL) as fh:
+        rows = fh.readlines()
     random.Random(seed).shuffle(rows)
     done = done_keys(out)
     stats, engines, tokens = Stats(), Engines(conc), [0]
     with out.open("a") as f:
       async with httpx.AsyncClient(timeout=None) as client:
-        async def one(i, row):
+        async def one(i, line):
             if f"blend:{seed}:{i}" in done:
                 return
+            row = json.loads(line)
             conv = row.get("conversations") or row.get("messages") or []
             first = next((m for m in conv if m.get("from", m.get("role")) in ("human", "user")), None)
             if first is None:
@@ -293,30 +293,28 @@ async def run_session(client, msgs, tools, turns, stats, max_tokens, budget, url
 
 
 async def sessions(n, conc, out, max_tokens, budget, seed):
-    import pyarrow.parquet as pq
-
-    rows = []
-    for p in sorted(REQUESTY.glob("*.parquet")):
-        rows += pq.read_table(p).to_pylist()
+    # sessions.jsonl holds the same sessions as the parquet shards; lines stay raw until their session starts.
+    with open(REQUESTY / "sessions.jsonl") as fh:
+        rows = fh.readlines()
     random.Random(seed).shuffle(rows)
     done = done_keys(out)
     stats, engines, tokens = Stats(), Engines(conc), [0]
     with out.open("a") as f:
       async with httpx.AsyncClient(timeout=None) as client:
-        async def one(i, row):
-            key = f"requesty:{row['id']}"
+        async def one(i, line):
+            key = "requesty:" + re.match(r'\{"id": "([^"]+)"', line).group(1)
             if key in done:
                 return
             url, sem = engines.pick(i)
             async with sem:
-                session_rows, generated = await run_session(client, json.loads(row["messages"]),
-                                                            json.loads(row["tools"]), row["turns"], stats,
-                                                            max_tokens, budget, url)
+                row = json.loads(line)
+                session_rows, generated = await run_session(client, row["messages"], row["tools"], row["turns"],
+                                                            stats, max_tokens, budget, url)
             tokens[0] += generated
             # A session's rows are written together, so a stop never leaves half a session behind.
             for r in session_rows:
                 r["messages"] = [{k: v for k, v in m.items() if k not in ("_ids", "_n")} for m in r["messages"]]
-                f.write(json.dumps({"key": key, **r, "source": f"requesty:{row['harness']}"}) + "\n")
+                f.write(json.dumps({"key": key, **r, "source": f"requesty:{row.get('instance_id', '')}"}) + "\n")
             if not session_rows:
                 f.write(json.dumps({"key": key, "messages": [], "completion_token_ids": [], "source": "empty"}) + "\n")
             f.flush()

@@ -6,7 +6,8 @@ served checkpoint. Data and captures from the first runs are in the private Hugg
 [`Geometric-AI/dsv41-flash-1017-dspark`](https://huggingface.co/datasets/Geometric-AI/dsv41-flash-1017-dspark).
 
 Set `DSPARK_CKPT` to the served checkpoint and `DSPARK_WORK` to the folder holding inputs that are not in this repo
-(the rollout corpus and Open-PerfectBlend); see `paths.py`.
+(`data/requesty-agent-sessions/` from the Hugging Face dataset, `data/open-perfectblend.jsonl` with
+Open-PerfectBlend's parquet rows as JSON lines in file order, and the rollout corpus); see `paths.py`.
 
 ## Workflow
 
