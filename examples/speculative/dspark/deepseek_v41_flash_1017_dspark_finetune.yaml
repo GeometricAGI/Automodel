@@ -58,6 +58,10 @@ recipe_args:
   # Session rows hold up to 32k tokens of context (replay.py sessions --budget 32768, estimated to within -3%/+9%)
   # plus the last turn's answer (max_tokens 4096).
   seq_length: 40960
+  # Pack documents into 40,960-token rows: three quarters of the rows are ~2k-token single-turn prompts that
+  # would otherwise be padded to full length. The target starts each document on a compression-group boundary and
+  # the draft keeps every block inside its document.
+  packed_sequence_size: 40960
   micro_batch_size: 1
   grad_accumulation_steps: 4
   num_workers: 2
