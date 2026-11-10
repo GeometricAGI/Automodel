@@ -62,6 +62,8 @@ recipe_args:
   # would otherwise be padded to full length. The target starts each document on a compression-group boundary and
   # the draft keeps every block inside its document.
   packed_sequence_size: 40960
+  # Packed rows are built once and memory-mapped by every rank and every relaunch (a resume starts in minutes).
+  packed_cache_dir: /data/cache/dspark_v41_1017_packed
   micro_batch_size: 1
   grad_accumulation_steps: 4
   num_workers: 2

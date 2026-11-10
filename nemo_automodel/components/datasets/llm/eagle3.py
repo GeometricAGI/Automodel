@@ -16,10 +16,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import multiprocessing as mp
 import os
 from typing import Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
@@ -125,11 +128,140 @@ def build_packed_eagle3_dataset(
     return packs
 
 
+_PACKED_FIELDS = ("input_ids", "loss_mask", "attention_mask", "position_ids", "doc_remaining")
+_PACK_SOURCE = None
+
+
+def _tokenize_source_sample(index: int) -> tuple[np.ndarray, np.ndarray]:
+    """Tokenize one source sample in a forked packing worker (reads the module-level source)."""
+    sample = _PACK_SOURCE[index]
+    return np.asarray(sample["input_ids"], dtype=np.int32), np.asarray(sample["loss_mask"], dtype=bool)
+
+
+class PackedArrayDataset(torch.utils.data.Dataset):
+    """Packed rows stored as memory-mapped arrays (see :func:`build_cached_packed_eagle3_dataset`)."""
+
+    def __init__(self, cache_dir: str) -> None:
+        self.arrays = {key: np.load(os.path.join(cache_dir, f"{key}.npy"), mmap_mode="r") for key in _PACKED_FIELDS}
+        self.seq_lens = np.load(os.path.join(cache_dir, "seq_lens.npy"))
+        self.seq_lens_offsets = np.load(os.path.join(cache_dir, "seq_lens_offsets.npy"))
+
+    def __len__(self) -> int:
+        return len(self.seq_lens_offsets) - 1
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        row = {key: self.arrays[key][index] for key in _PACKED_FIELDS}
+        row["seq_lens"] = self.seq_lens[self.seq_lens_offsets[index] : self.seq_lens_offsets[index + 1]].tolist()
+        return row
+
+
+def build_cached_packed_eagle3_dataset(
+    source_dataset,
+    *,
+    packed_sequence_size: int,
+    pad_token_id: int,
+    cache_dir: str,
+    manifest: dict[str, Any],
+    num_processes: int = 32,
+) -> PackedArrayDataset:
+    """Pack like :func:`build_packed_eagle3_dataset`, once, into memory-mapped arrays every rank shares.
+
+    The in-memory packer holds five Python int lists per row on every rank: ~165 GB of host memory per rank for
+    80k long agentic rows, and ~45 minutes of single-process tokenization on every launch. Rank 0 instead tokenizes
+    the source in ``num_processes`` forked workers, packs in the same order with the same greedy rule (so the rows
+    are identical), and writes int32 arrays; the other ranks wait, and later launches with the same ``manifest``
+    map the arrays directly. A cache built from different data or settings is rejected.
+
+    Args:
+        source_dataset: Indexable dataset of unpadded samples with ``input_ids`` and ``loss_mask``.
+        packed_sequence_size: Row width.
+        pad_token_id: Padding token for the tail of each row.
+        cache_dir: Directory for the arrays and ``manifest.json``.
+        manifest: JSON-serializable description of the source and settings; must match an existing cache.
+        num_processes: Tokenization workers on rank 0.
+
+    Returns:
+        Dataset whose rows hold the five packed fields (int32 arrays of length ``packed_sequence_size``) and
+        ``seq_lens``.
+    """
+    global _PACK_SOURCE
+    manifest_path = os.path.join(cache_dir, "manifest.json")
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    if rank == 0 and not os.path.exists(manifest_path):
+        os.makedirs(cache_dir, exist_ok=True)
+        rows: dict[str, list[np.ndarray]] = {key: [] for key in _PACKED_FIELDS}
+        seq_lens: list[int] = []
+        offsets = [0]
+        cur_ids: list[np.ndarray] = []
+        cur_loss: list[np.ndarray] = []
+        cur_lens: list[int] = []
+
+        def flush() -> None:
+            if not cur_lens:
+                return
+            ids = np.full(packed_sequence_size, pad_token_id, dtype=np.int32)
+            loss = np.zeros(packed_sequence_size, dtype=np.int32)
+            attn = np.zeros(packed_sequence_size, dtype=np.int32)
+            pos = np.empty(packed_sequence_size, dtype=np.int32)
+            remaining = np.zeros(packed_sequence_size, dtype=np.int32)
+            at = 0
+            for doc_ids, doc_loss in zip(cur_ids, cur_loss):
+                n = len(doc_ids)
+                ids[at : at + n] = doc_ids
+                loss[at : at + n] = doc_loss
+                pos[at : at + n] = np.arange(n)
+                remaining[at : at + n] = np.arange(n - 1, -1, -1)
+                at += n
+            attn[:at] = 1
+            # Fold trailing pad into the final document (continue its position ids).
+            pos[at:] = np.minimum(pos[at - 1] + 1 + np.arange(packed_sequence_size - at), packed_sequence_size - 1)
+            lens = list(cur_lens)
+            lens[-1] += packed_sequence_size - at
+            for key, value in zip(_PACKED_FIELDS, (ids, loss, attn, pos, remaining)):
+                rows[key].append(value)
+            seq_lens.extend(lens)
+            offsets.append(len(seq_lens))
+            cur_ids.clear()
+            cur_loss.clear()
+            cur_lens.clear()
+
+        _PACK_SOURCE = source_dataset
+        try:
+            with mp.get_context("fork").Pool(num_processes) as pool:
+                for ids, loss in pool.imap(_tokenize_source_sample, range(len(source_dataset)), chunksize=16):
+                    ids, loss = ids[:packed_sequence_size], loss[:packed_sequence_size]
+                    if len(ids) == 0:
+                        continue
+                    if cur_lens and sum(cur_lens) + len(ids) > packed_sequence_size:
+                        flush()
+                    cur_ids.append(ids)
+                    cur_loss.append(loss)
+                    cur_lens.append(len(ids))
+            flush()
+        finally:
+            _PACK_SOURCE = None
+        if len(offsets) == 1:
+            raise ValueError(f"No packs were produced for packed_sequence_size={packed_sequence_size}")
+        for key in _PACKED_FIELDS:
+            np.save(os.path.join(cache_dir, f"{key}.npy"), np.stack(rows[key]))
+        np.save(os.path.join(cache_dir, "seq_lens.npy"), np.asarray(seq_lens, dtype=np.int64))
+        np.save(os.path.join(cache_dir, "seq_lens_offsets.npy"), np.asarray(offsets, dtype=np.int64))
+        with open(manifest_path, "w") as f:  # written last: its presence marks a complete cache
+            json.dump(manifest, f, indent=2, sort_keys=True)
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    with open(manifest_path) as f:
+        saved = json.load(f)
+    if saved != json.loads(json.dumps(manifest)):
+        raise ValueError(f"Packed cache {cache_dir} was built from different data or settings: {saved} != {manifest}")
+    return PackedArrayDataset(cache_dir)
+
+
 def _pack_collate(features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
     """Collate packed rows; ragged ``seq_lens`` is 0-padded to ``[B, max_docs]``."""
     batch = {}
-    for key in ("input_ids", "loss_mask", "attention_mask", "position_ids", "doc_remaining"):
-        batch[key] = torch.tensor([feature[key] for feature in features], dtype=torch.long)
+    for key in _PACKED_FIELDS:
+        batch[key] = torch.as_tensor(np.stack([np.asarray(feature[key]) for feature in features]), dtype=torch.long)
     max_docs = max(len(feature["seq_lens"]) for feature in features)
     seq_lens = torch.zeros(len(features), max_docs, dtype=torch.long)
     for i, feature in enumerate(features):
@@ -155,6 +287,7 @@ def build_eagle3_dataloader(
     dp_mesh=None,
     mask_generation_prompt: bool = False,
     chat_template_kwargs: dict[str, Any] | None = None,
+    packed_cache_dir: str | None = None,
 ) -> DataLoader:
     """Build a dataloader backed by the repo's chat formatting utilities.
 
@@ -169,6 +302,9 @@ def build_eagle3_dataloader(
 
     ``chat_template_kwargs`` are extra chat template variables passed to every render
     (see :class:`ChatDataset`).
+
+    ``packed_cache_dir`` stores the packed rows as shared memory-mapped arrays, built once (see
+    :func:`build_cached_packed_eagle3_dataset`); ``None`` packs in memory on every rank.
     """
     collate_fn = _stack_batch
     if packed_sequence_size > 0:
@@ -186,11 +322,34 @@ def build_eagle3_dataloader(
             mask_generation_prompt=mask_generation_prompt,
             chat_template_kwargs=chat_template_kwargs,
         )
-        dataset = build_packed_eagle3_dataset(
-            source,
-            packed_sequence_size=packed_sequence_size,
-            pad_token_id=source.pad_token_id,
-        )
+        if packed_cache_dir:
+            stat = os.stat(data_path) if os.path.isfile(data_path) else None
+            manifest = {
+                "data_path": data_path,
+                "data_size": stat.st_size if stat else None,
+                "data_mtime": int(stat.st_mtime) if stat else None,
+                "split": split,
+                "shuffle_seed": shuffle_seed,
+                "packed_sequence_size": packed_sequence_size,
+                "pad_token_id": source.pad_token_id,
+                "mask_reasoning_content": mask_reasoning_content,
+                "mask_generation_prompt": mask_generation_prompt,
+                "chat_template_kwargs": chat_template_kwargs,
+                "num_samples": len(source),
+            }
+            dataset = build_cached_packed_eagle3_dataset(
+                source,
+                packed_sequence_size=packed_sequence_size,
+                pad_token_id=source.pad_token_id,
+                cache_dir=packed_cache_dir,
+                manifest=manifest,
+            )
+        else:
+            dataset = build_packed_eagle3_dataset(
+                source,
+                packed_sequence_size=packed_sequence_size,
+                pad_token_id=source.pad_token_id,
+            )
         collate_fn = _pack_collate
     else:
         dataset = ChatDataset(

@@ -1044,6 +1044,8 @@ class TrainDSparkRecipe(BaseRecipe):
                         target_attn_impl=getattr(self.target_model.config, "_attn_implementation", None) or "",
                         micro_batch_size=int(recipe_cfg.micro_batch_size),
                     )
+                # Packed rows can be cached on disk once and memory-mapped by every rank (and every relaunch).
+                packed_cache_dir = recipe_cfg.get("packed_cache_dir", None)
                 self.train_dataloader = build_eagle3_dataloader(
                     data_path=recipe_cfg.train_data_path,
                     tokenizer=self.tokenizer,
@@ -1057,6 +1059,7 @@ class TrainDSparkRecipe(BaseRecipe):
                     mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
                     mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
                     chat_template_kwargs=chat_template_kwargs,
+                    packed_cache_dir=os.path.join(packed_cache_dir, "train") if packed_cache_dir else None,
                     packed_sequence_size=self.packed_sequence_size,
                     dp_mesh=self.dp_mesh,
                 )
@@ -1075,6 +1078,7 @@ class TrainDSparkRecipe(BaseRecipe):
                         mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
                         mask_generation_prompt=recipe_cfg.get("mask_generation_prompt", False),
                         chat_template_kwargs=chat_template_kwargs,
+                        packed_cache_dir=os.path.join(packed_cache_dir, "val") if packed_cache_dir else None,
                         packed_sequence_size=self.packed_sequence_size,
                     )
         else:
