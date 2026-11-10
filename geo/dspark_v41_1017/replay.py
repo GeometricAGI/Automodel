@@ -287,7 +287,14 @@ async def run_session(client, msgs, tools, turns, stats, max_tokens, budget, url
                 return rows, generated
             window, start = window + 1, new_start
         context = [{k: v for k, v in m.items() if k not in ("train", "_ids", "_n")} for m in [system] + history[start:]]
-        msg, ids, usage = await turn(client, context, stats, max_tokens, tools, url)
+        for attempt in range(3):  # a dropped connection costs a retry, not the whole run
+            try:
+                msg, ids, usage = await turn(client, context, stats, max_tokens, tools, url)
+                break
+            except httpx.HTTPError:
+                await asyncio.sleep(5 * (attempt + 1))
+        else:
+            break  # end this session with the rows it already has
         generated += (usage or {}).get("completion_tokens", 0)
         if not ids or ids[-1] != EOS_ID:
             break  # cut off at max_tokens: no history to continue from
