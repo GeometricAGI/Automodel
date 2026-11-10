@@ -122,7 +122,9 @@ checkpoint:
   enabled: true
   checkpoint_dir: /data/outputs/dspark_v41_1017_finetune/checkpoints
   model_save_format: safetensors
-  save_consolidated: final
+  # Consolidate offline for export (geo/dspark_v41_1017/consolidate_draft.sh): the in-trainer pass fails on the
+  # draft's index (KeyError mtp.0.hc_attn_base); resuming needs only the sharded checkpoints.
+  save_consolidated: false
   dequantize_base_checkpoint: true
   restore_from: LATEST
   # A checkpoint is ~220 GB (BF16 draft plus FP32 Adam state); keep the last two.
