@@ -149,11 +149,10 @@ class _DeepseekV41DSparkAttention(DeepseekV41Attention):
         window_index = last_visible.unsqueeze(-1) - window + 1 + torch.arange(window, device=positions.device)
         before_start = window_index < 0  # a window reaching before position 0 gathers padding, masked below
         context_index = window_index.clamp(min=0)  # [batch, blocks, window]
-        gathered_kv = torch.gather(
-            target_kv.unsqueeze(1).expand(-1, blocks, -1, -1),
-            2,
-            context_index.unsqueeze(-1).expand(-1, -1, -1, self.head_dim),
-        )  # [batch, blocks, window, head_dim]
+        # Advanced indexing, not gather on an expanded view: its gradient is accumulated into a [batch, context,
+        # head_dim] tensor instead of materializing one per block.
+        batch_index = torch.arange(batch, device=positions.device).view(batch, 1, 1)
+        gathered_kv = target_kv[batch_index, context_index]  # [batch, blocks, window, head_dim]
         block_kv = draft_kv.view(batch, blocks, self.block_size, self.head_dim)
         kv = torch.cat((gathered_kv, block_kv, block_kv.new_zeros(batch, blocks, 1, self.head_dim)), dim=2)
 
