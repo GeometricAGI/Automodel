@@ -91,9 +91,27 @@ def _hc_collapse_core(hidden_states: torch.Tensor, pre_mix: torch.Tensor) -> tor
     return (pre_mix.unsqueeze(-1) * hidden_states.float()).sum(2).to(hidden_states.dtype)
 
 
+_HC_EXPAND_CHUNK_TOKENS = 8192
+
+
 def _hc_expand_core(
     output: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
 ) -> torch.Tensor:
+    if output.shape[1] > _HC_EXPAND_CHUNK_TOKENS:
+        # The stream mix builds a [batch, sequence, streams, streams, hidden] FP32 product (12.5 GiB at 40k tokens);
+        # sequence chunks bound it and leave every element's arithmetic, so the result, unchanged.
+        return torch.cat(
+            [
+                _hc_expand_core(
+                    output[:, i : i + _HC_EXPAND_CHUNK_TOKENS],
+                    residual[:, i : i + _HC_EXPAND_CHUNK_TOKENS],
+                    post[:, i : i + _HC_EXPAND_CHUNK_TOKENS],
+                    comb[:, i : i + _HC_EXPAND_CHUNK_TOKENS],
+                )
+                for i in range(0, output.shape[1], _HC_EXPAND_CHUNK_TOKENS)
+            ],
+            dim=1,
+        )
     update = post.unsqueeze(-1) * output.unsqueeze(-2)
     mixed = (comb.unsqueeze(-1) * residual.unsqueeze(-2)).sum(2)
     return (update + mixed).to(output.dtype)
