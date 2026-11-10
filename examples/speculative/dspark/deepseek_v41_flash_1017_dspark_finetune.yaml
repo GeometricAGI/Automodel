@@ -42,7 +42,9 @@ distributed:
       cast_forward_inputs: false
 
 recipe_args:
-  target_model_name_or_path: /data/models/DeepSeek-V4.1-Flash-1017
+  # The frozen target loads from a BF16 copy (geo/dspark_v41_1017/dequantize_target.py): dequantizing the
+  # released FP8/FP4 checkpoint while loading runs 8x B300 out of memory. The draft starts from the released weights.
+  target_model_name_or_path: /data/models/DeepSeek-V4.1-Flash-1017-bf16
   draft_init_from: /data/models/DeepSeek-V4.1-Flash-1017
   confidence_head_input: residual
   # Or a local path to a downloaded V4.1-Flash checkpoint:
