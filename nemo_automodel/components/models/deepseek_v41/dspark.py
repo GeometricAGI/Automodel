@@ -93,6 +93,7 @@ class _DeepseekV41DSparkAttention(DeepseekV41Attention):
         super().__init__(config, layer_idx, backend)
         if self.compress_ratio != 0 or self.compressor is not None or self.indexer is not None:
             raise ValueError("DeepSeek V4.1 DSpark layers must be SWA-only with compress_ratio=0")
+        self.block_size = config.dspark_block_size
 
     def forward(
         self,
@@ -137,29 +138,46 @@ class _DeepseekV41DSparkAttention(DeepseekV41Attention):
         target_kv = quantize_cache(target_kv, format="fp8", block_size=32)
         draft_kv = _apply_rope(self.kv_norm(self.wkv(hidden_states)), draft_angles)
         draft_kv = quantize_cache(draft_kv, format="fp8", block_size=32)
-        kv = torch.cat((target_kv, draft_kv), dim=1)
+        # Each block of draft queries sees at most the window of target keys ending before its anchor plus its own
+        # block (build_attention_mask), so attend over those keys alone: gather them and their mask values instead
+        # of scoring every query against the whole context. Gathered keys the mask hides keep their -inf bias.
+        blocks = draft_sequence // self.block_size
+        window = min(self.window_size, context_sequence)
+        block_rows = attention_mask[:, 0, :: self.block_size, :context_sequence]  # [batch, blocks, context]
+        positions = torch.arange(context_sequence, device=attention_mask.device)
+        last_visible = torch.where(block_rows == 0, positions, -1).amax(dim=-1)  # [batch, blocks]
+        window_index = last_visible.unsqueeze(-1) - window + 1 + torch.arange(window, device=positions.device)
+        before_start = window_index < 0  # a window reaching before position 0 gathers padding, masked below
+        context_index = window_index.clamp(min=0)  # [batch, blocks, window]
+        gathered_kv = torch.gather(
+            target_kv.unsqueeze(1).expand(-1, blocks, -1, -1),
+            2,
+            context_index.unsqueeze(-1).expand(-1, -1, -1, self.head_dim),
+        )  # [batch, blocks, window, head_dim]
+        block_kv = draft_kv.view(batch, blocks, self.block_size, self.head_dim)
+        kv = torch.cat((gathered_kv, block_kv, block_kv.new_zeros(batch, blocks, 1, self.head_dim)), dim=2)
 
+        query_rows = attention_mask[:, 0].reshape(batch, blocks, self.block_size, -1)
+        context_bias = torch.gather(
+            query_rows[..., :context_sequence], 3, context_index.unsqueeze(2).expand(-1, -1, self.block_size, -1)
+        ).masked_fill(before_start.unsqueeze(2), float("-inf"))
+        draft_columns = context_sequence + torch.arange(draft_sequence, device=positions.device).view(blocks, -1)
+        block_bias = torch.gather(
+            query_rows, 3, draft_columns.view(1, blocks, 1, -1).expand(batch, -1, self.block_size, -1)
+        )
         # The synthetic zero-valued key contributes only the learned sink logit
         # to the softmax denominator, matching the released sparse-attention op.
-        kv = torch.cat((kv, kv.new_zeros(batch, 1, self.head_dim)), dim=1)
-        bias = attention_mask.expand(-1, self.num_heads, -1, -1).float()
-        sink = self.sinks_param(query).view(1, self.num_heads, 1, 1).expand(batch, -1, draft_sequence, -1)
-        bias = torch.cat((bias, sink), dim=-1)
-        if self.backend.attn == "sdpa":
-            attended = F.scaled_dot_product_attention(
-                query.transpose(1, 2),
-                kv.unsqueeze(1),
-                kv.unsqueeze(1),
-                attn_mask=bias,
-                dropout_p=self.attention_dropout if self.training else 0.0,
-                scale=self.head_dim**-0.5,
-            ).transpose(1, 2)
-        else:
-            with torch.autocast(device_type=query.device.type, enabled=False):
-                logits = torch.einsum("bshd,btd->bhst", query.float(), kv.float()) * self.head_dim**-0.5
-                probabilities = (logits + bias).softmax(dim=-1)
-                probabilities = F.dropout(probabilities, p=self.attention_dropout, training=self.training)
-                attended = torch.einsum("bhst,btd->bshd", probabilities, kv.float()).to(query.dtype)
+        sink = self.sinks_param(query).view(1, 1, 1, self.num_heads, 1).float()
+        bias = torch.cat((context_bias, block_bias), dim=-1).float().unsqueeze(3)  # [batch, blocks, block, 1, keys]
+        block_query = query.view(batch, blocks, self.block_size, self.num_heads, self.head_dim)
+        with torch.autocast(device_type=query.device.type, enabled=False):
+            logits = torch.einsum("bnshd,bnkd->bnshk", block_query.float(), kv.float()) * self.head_dim**-0.5
+            logits = logits + torch.cat((bias.expand(-1, -1, -1, self.num_heads, -1), sink.expand(
+                batch, blocks, self.block_size, -1, -1)), dim=-1)
+            probabilities = logits.softmax(dim=-1)
+            probabilities = F.dropout(probabilities, p=self.attention_dropout, training=self.training)
+            attended = torch.einsum("bnshk,bnkd->bnshd", probabilities, kv.float()).to(query.dtype)
+        attended = attended.reshape(batch, draft_sequence, self.num_heads, self.head_dim)
         valid_tokens = torch.ones(batch, draft_sequence, dtype=torch.bool, device=hidden_states.device)
         return self._project_output(attended, draft_angles, valid_tokens)
 
