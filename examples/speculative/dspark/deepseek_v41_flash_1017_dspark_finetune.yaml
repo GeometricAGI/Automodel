@@ -24,7 +24,9 @@ wandb:
 
 distributed:
   strategy: fsdp2
-  defer_fsdp_grad_sync: true
+  # Deferring the sync keeps the draft's unsharded FP32 gradients (~53 GB per GPU) across the accumulation window,
+  # which does not fit beside the BF16 target; reduce-scatter every micro-batch instead.
+  defer_fsdp_grad_sync: false
   tp_size: 1
   cp_size: 1
   pp_size: 1
