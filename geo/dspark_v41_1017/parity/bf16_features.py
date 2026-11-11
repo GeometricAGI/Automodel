@@ -2,7 +2,8 @@
 
 Builds the fine-tune recipe (its frozen target, EP over all ranks) and runs each captured sequence through the
 recipe's target wrapper as a one-document packed row, as training does. Every rank runs every sequence; rank 0
-saves a list of [sequence, features] BF16 tensors in the capture's order. feature_gap.py compares them.
+saves a list of [sequence, features] BF16 tensors in the capture's order, and the final-norm states ([sequence,
+hidden], for the target's output distribution) beside it as <out>.last.pt. feature_gap.py and tree_sizing.py read them.
 
   torchrun --standalone --nproc_per_node=8 bf16_features.py <capture .pt> <out .pt> -c <recipe yaml> [key=value ...]
 """
@@ -23,7 +24,7 @@ def main():
     recipe = TrainDSparkRecipe(cfg)
     recipe.setup()
     records = torch.load(capture, weights_only=False)
-    features = []
+    features, last = [], []
     for i, rec in enumerate(records):
         n = len(rec["input_ids"])
         width = -(-n // PAD_MULTIPLE) * PAD_MULTIPLE
@@ -38,10 +39,12 @@ def main():
             doc_remaining=(width - pos)[None].to(recipe.device),
         )
         features.append(batch.target_hidden_states[0, :n].to("cpu", torch.bfloat16))
+        last.append(batch.target_last_hidden_states[0, :n].to("cpu", torch.bfloat16))
         if dist.get_rank() == 0:
             print(f"{i}: {n} tokens, features {tuple(features[-1].shape)}", flush=True)
     if dist.get_rank() == 0:
         torch.save(features, out)
+        torch.save(last, out.removesuffix(".pt") + ".last.pt")
     dist.barrier()
     dist.destroy_process_group()
 

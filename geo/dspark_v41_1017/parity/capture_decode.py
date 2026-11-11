@@ -5,7 +5,7 @@ vLLM computes prefill features only for the last 128 prompt positions (the draft
 steps compute them for every verified token. A row is kept when every token from the step's first position up to
 its own equals the final sequence (so its causal context is the real one).
 
-  VLLM_ENABLE_V1_MULTIPROCESSING=0 python capture_decode.py <replay .jsonl> <out .pt> [--n 16] [--max-tokens 768]
+  VLLM_ENABLE_V1_MULTIPROCESSING=0 python capture_decode.py <replay .jsonl> <out .pt> [--n 16] [--max-tokens 768] [--temperature 0]
 """
 import argparse
 import json
@@ -45,6 +45,7 @@ def main():
     ap.add_argument("out", type=pathlib.Path)
     ap.add_argument("--n", type=int, default=16)
     ap.add_argument("--max-tokens", type=int, default=768)
+    ap.add_argument("--temperature", type=float, default=0.0, help="1.0 is production's default; seeded per prompt")
     a = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -68,7 +69,7 @@ def main():
     for prompt in prompts:
         steps.clear()
         gen = llm.generate([TokensPrompt(prompt_token_ids=prompt)],
-                           SamplingParams(max_tokens=a.max_tokens, temperature=0), use_tqdm=False)[0].outputs[0]
+                           SamplingParams(max_tokens=a.max_tokens, temperature=a.temperature, seed=len(out)), use_tqdm=False)[0].outputs[0]
         seq = torch.tensor(prompt + list(gen.token_ids))
         feats = torch.zeros(len(seq), steps[0]["feats"].shape[1], dtype=torch.bfloat16)
         valid = torch.zeros(len(seq), dtype=torch.bool)
