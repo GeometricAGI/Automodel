@@ -27,13 +27,14 @@ def main():
     from vllm.inputs import TokensPrompt
 
     records = torch.load(a.capture, weights_only=False)
-    longest = max(len(r["input_ids"]) for r in records)
-    llm = LLM(str(CKPT), max_model_len=longest + 64, gpu_memory_utilization=0.97, kv_cache_memory_bytes=4831838208,
-              max_num_seqs=1, max_num_batched_tokens=max(8192, longest + 64), enforce_eager=True,
+    # One length for both, as capture_decode.py: the startup warm-up runs a max_num_batched_tokens batch through
+    # the model, which faults in the attention output projection's autotune when that exceeds max_model_len.
+    length = max(8192, max(len(r["input_ids"]) for r in records) + 64)
+    llm = LLM(str(CKPT), max_model_len=length, gpu_memory_utilization=0.97, kv_cache_memory_bytes=4831838208,
+              max_num_seqs=1, max_num_batched_tokens=length, enforce_eager=True,
               enable_prefix_caching=False, engram_config={"use_thp": True}, safetensors_load_strategy="lazy",
               max_logprobs=a.top_k,
-              # As capture_decode.py: this build's kernels are exercised with DSpark on (without it the
-              # startup MXFP8 autotune faults); scoring a prompt does not draft.
+              # As capture_decode.py; scoring a prompt does not draft.
               speculative_config={"method": "dspark", "num_speculative_tokens": 3})
     out = []
     for i, rec in enumerate(records):
