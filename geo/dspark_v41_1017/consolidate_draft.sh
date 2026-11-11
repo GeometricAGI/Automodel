@@ -22,4 +22,18 @@ print(f"{len(keys)} tensors -> one file")
 EOF
 python3 tools/offline_hf_consolidation.py --backend gloo --num-threads 8 \
   --model-name /data/models/DeepSeek-V4.1-Flash-1017-bf16 --input-dir "$CKPT/model" --output-dir "$OUT" --cast-dtype bf16
+# The tool writes FP32-mapped tensors' dtype as "float32", which safetensors rejects; rewrite it as "F32" in place.
+python3 - "$OUT"/model-*.safetensors <<'EOF'
+import json, struct, sys
+for p in sys.argv[1:]:
+    with open(p, "r+b") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(n))
+        for k, v in header.items():
+            if k != "__metadata__" and v["dtype"] == "float32":
+                v["dtype"] = "F32"
+        s = json.dumps(header, separators=(",", ":")).encode()
+        f.seek(8)
+        f.write(s + b" " * (n - len(s)))
+EOF
 ls -la "$OUT"
